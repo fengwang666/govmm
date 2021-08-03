@@ -2988,8 +2988,8 @@ func LaunchJailedQemu(config Config, logger QMPLog) (string, error) {
 	}
 
 	src := "/opt/kata"
-	dest := path.Join(chroot, src)
-	if err := CopyDirectory(src, dest); err != nil {
+	// dest := path.Join(chroot, src)
+	if err := CopyDirectory(src, chroot); err != nil {
 		return "", err
 	}
 
@@ -3081,7 +3081,8 @@ func CopyDirectory(scrDir, dest string) error {
 	}
 	for _, entry := range entries {
 		sourcePath := filepath.Join(scrDir, entry.Name())
-		destPath := filepath.Join(dest, entry.Name())
+		//destPath := filepath.Join(dest, entry.Name())
+		destPath := dest
 
 		fileInfo, err := os.Stat(sourcePath)
 		if err != nil {
@@ -3102,10 +3103,12 @@ func CopyDirectory(scrDir, dest string) error {
 				return err
 			}
 		case os.ModeSymlink:
+			destPath = filepath.Join(dest, entry.Name())
 			if err := CopySymLink(sourcePath, destPath); err != nil {
 				return err
 			}
 		default:
+			destPath = filepath.Join(dest, entry.Name())
 			if err := Copy(sourcePath, destPath); err != nil {
 				return err
 			}
