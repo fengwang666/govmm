@@ -27,9 +27,13 @@ package qemu
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
+	"path"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -2436,6 +2440,9 @@ type Config struct {
 	// Path is the qemu binary path.
 	Path string
 
+	// JailerPath is the jailer executable host path.
+	JailerPath string
+
 	// Ctx is the context used when launching qemu.
 	Ctx context.Context
 
@@ -2950,3 +2957,221 @@ func LaunchCustomQemu(ctx context.Context, path string, params []string, fds []*
 	}
 	return errStr, err
 }
+type JailerConfig struct {
+	execPath string
+
+}
+func LaunchJailedQemu(config Config, logger QMPLog) (string, error) {
+	// copy the assets to the chroot directory
+	// change the asset file ownership
+	// construct jailer commandline
+	// start jailer process
+	errStr := ""
+	if err := prepareParam(config, logger); err != nil {
+		return "", err
+	}
+
+	ctx := config.Ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	// hardcode the chroot for now
+	chrootBase := "/test"
+
+	chroot := path.Join(chrootBase, "qemu-system-x86_64", "testqemu", "root")
+
+	if _, err := os.Stat(chroot); os.IsNotExist(err) {
+		if err := os.MkdirAll(chroot, 755); err != nil {
+			return "", err
+		}
+	}
+
+	src := "/opt/kata"
+	dest := path.Join(chroot, src)
+	if err := CopyDirectory(src, dest); err != nil {
+		return "", err
+	}
+
+	if err := CopyFile(config.Path, path.Join(chroot, config.Path)); err != nil {
+		return fmt.Sprintf("Copy config path failed %s", config.Path), err
+	}
+	if err := CopyFile(config.Kernel.Path, path.Join(chroot, config.Kernel.Path)); err != nil {
+		return fmt.Sprintf("Copy kernel path failed %s", config.Kernel.Path), err
+	}
+	//if err := CopyFile(config.Kernel.InitrdPath, path.Join(chroot, config.Kernel.InitrdPath)); err != nil {
+	//	return fmt.Sprintf("Copy Initrd path failed %s", config.Kernel.InitrdPath), err
+	//}
+
+	jailedArgs := []string{
+		"--id", "testqemu",
+		"--node", "0", //FIXME: Comprehend NUMA topology or explicit ignore
+		"--exec-file", config.Path,
+		"--uid", "0", //https://github.com/kata-containers/runtime/issues/1869
+		"--gid", "0",
+		"--chroot-base-dir", chrootBase,
+	}
+
+	var cmd *exec.Cmd
+	var args []string
+	args = append(args, jailedArgs...)
+	//if fc.netNSPath != "" {
+	//	args = append(args, "--netns", fc.netNSPath)
+	//}
+
+	args = append(args, "--")
+	args = append(args, config.qemuParams...)
+	// hardcode the jailer path for now
+	config.JailerPath = "/opt/kata/bin/jailer"
+	cmd = exec.CommandContext(ctx, config.JailerPath, args...)
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+	logger.Infof("launching %s with: %v", config.JailerPath, args)
+
+	err := cmd.Run()
+	if err != nil {
+		logger.Errorf("Unable to launch %s: %v", config.JailerPath, err)
+		errStr = stderr.String()
+		logger.Errorf("%s", errStr)
+	}
+	return errStr, err
+}
+
+func prepareParam(config Config, logger QMPLog) error {
+	config.appendName()
+	config.appendUUID()
+	config.appendMachine()
+	config.appendCPUModel()
+	config.appendQMPSockets()
+	config.appendMemory()
+	config.appendDevices()
+	config.appendRTC()
+	config.appendGlobalParam()
+	config.appendPFlashParam()
+	config.appendVGA()
+	config.appendKnobs()
+	config.appendKernel()
+	config.appendBios()
+	config.appendIOThreads()
+	config.appendIncoming()
+	config.appendPidFile()
+	config.appendLogFile()
+	config.appendFwCfg(logger)
+	config.appendSeccompSandbox()
+
+	if err := config.appendCPUs(); err != nil {
+		return err
+	}
+	return nil
+}
+
+func CopyFile(src, dest string) error {
+	parent := filepath.Dir(dest)
+	if err := CreateIfNotExists(parent, 0755); err != nil {
+		return err
+	}
+	return Copy(src, dest)
+}
+
+func CopyDirectory(scrDir, dest string) error {
+	entries, err := ioutil.ReadDir(scrDir)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		sourcePath := filepath.Join(scrDir, entry.Name())
+		destPath := filepath.Join(dest, entry.Name())
+
+		fileInfo, err := os.Stat(sourcePath)
+		if err != nil {
+			return err
+		}
+
+		stat, ok := fileInfo.Sys().(*syscall.Stat_t)
+		if !ok {
+			return fmt.Errorf("failed to get raw syscall.Stat_t data for '%s'", sourcePath)
+		}
+
+		switch fileInfo.Mode() & os.ModeType{
+		case os.ModeDir:
+			if err := CreateIfNotExists(destPath, 0755); err != nil {
+				return err
+			}
+			if err := CopyDirectory(sourcePath, destPath); err != nil {
+				return err
+			}
+		case os.ModeSymlink:
+			if err := CopySymLink(sourcePath, destPath); err != nil {
+				return err
+			}
+		default:
+			if err := Copy(sourcePath, destPath); err != nil {
+				return err
+			}
+		}
+
+		if err := os.Lchown(destPath, int(stat.Uid), int(stat.Gid)); err != nil {
+			return err
+		}
+
+		isSymlink := entry.Mode()&os.ModeSymlink != 0
+		if !isSymlink {
+			if err := os.Chmod(destPath, entry.Mode()); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func Copy(srcFile, dstFile string) error {
+	out, err := os.Create(dstFile)
+	if err != nil {
+		return err
+	}
+
+	defer out.Close()
+
+	in, err := os.Open(srcFile)
+	defer in.Close()
+	if err != nil {
+		return err
+	}
+
+	_, err = io.Copy(out, in)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func Exists(filePath string) bool {
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return false
+	}
+
+	return true
+}
+
+func CreateIfNotExists(dir string, perm os.FileMode) error {
+	if Exists(dir) {
+		return nil
+	}
+
+	if err := os.MkdirAll(dir, perm); err != nil {
+		return fmt.Errorf("failed to create directory: '%s', error: '%s'", dir, err.Error())
+	}
+
+	return nil
+}
+
+func CopySymLink(source, dest string) error {
+	link, err := os.Readlink(source)
+	if err != nil {
+		return err
+	}
+	return os.Symlink(link, dest)
+}
+
