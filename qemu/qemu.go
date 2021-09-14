@@ -2465,8 +2465,6 @@ type Config struct {
 	Uid uint32
 	// Group ID.
 	Gid uint32
-	// Supplementary group IDs.
-	Groups []uint32
 
 	// Name is the qemu guest name
 	Name string
@@ -2887,6 +2885,13 @@ func (config *Config) appendFwCfg(logger QMPLog) {
 	}
 }
 
+func (config *Config) appendRunas() {
+	if config.Uid != 0 || config.Gid != 0 {
+		config.qemuParams = append(config.qemuParams, "-runas")
+		config.qemuParams = append(config.qemuParams, fmt.Sprintf("%d:%d", config.Uid, config.Gid))
+	}
+}
+
 // LaunchQemu can be used to launch a new qemu instance.
 //
 // The Config parameter contains a set of qemu parameters and settings.
@@ -2917,6 +2922,7 @@ func LaunchQemu(config Config, logger QMPLog) (string, error) {
 	config.appendLogFile()
 	config.appendFwCfg(logger)
 	config.appendSeccompSandbox()
+	config.appendRunas()
 
 	if err := config.appendCPUs(); err != nil {
 		return "", err
@@ -2927,15 +2933,8 @@ func LaunchQemu(config Config, logger QMPLog) (string, error) {
 		ctx = context.Background()
 	}
 
-	attr := syscall.SysProcAttr{}
-	attr.Credential = &syscall.Credential{
-		Uid:    config.Uid,
-		Gid:    config.Gid,
-		Groups: config.Groups,
-	}
-
 	return LaunchCustomQemu(ctx, config.Path, config.qemuParams,
-		config.fds, &attr, logger)
+		config.fds, nil, logger)
 }
 
 // LaunchCustomQemu can be used to launch a new qemu instance.
